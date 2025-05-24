@@ -20,6 +20,11 @@ const mainAdmins = [];
 const subAdmins = [];
 const blacklistedUsers = [];
 
+// สถานะการอนุญาตเชิญสมาชิกใหม่
+let allowInvite = true; // ค่าเริ่มต้นคืออนุญาตให้เชิญได้
+// สถานะการอนุญาตให้วางลิงก์
+let allowLinks = true; // ค่าเริ่มต้นคืออนุญาตให้วางลิงก์ได้
+
 // ฟังก์ชันตรวจสอบว่าเป็นแอดมินหลักหรือแอดมินรอง
 function isAdmin(userId) {
   return mainAdmins.includes(userId) || subAdmins.includes(userId);
@@ -84,8 +89,16 @@ function removeBlacklistedUser(userId) {
     return false;
 }
 
-// สถานะการอนุญาตเชิญสมาชิกใหม่ (เก็บในหน่วยความจำ)
-let allowInvite = true; // ค่าเริ่มต้นคืออนุญาตให้เชิญได้
+// *** เพิ่มฟังก์ชันดึงโปรไฟล์ผู้ใช้ ***
+async function getUserProfile(userId) {
+    try {
+        const profile = await client.getProfile(userId);
+        return profile; // { displayName, pictureUrl, statusMessage }
+    } catch (error) {
+        console.error('Error fetching user profile for ID:', userId, error);
+        return null;
+    }
+}
 
 // Webhook endpoint สำหรับรับข้อความจาก LINE
 app.post('/webhook', line.middleware(config), (req, res) => {
@@ -99,44 +112,28 @@ app.post('/webhook', line.middleware(config), (req, res) => {
 
 // ฟังก์ชันสำหรับจัดการเหตุการณ์ต่างๆ
 async function handleEvent(event) {
+  // console.log('--- Start LINE Event Log ---'); // สามารถเปิดหรือปิดได้หลังแก้ปัญหา
+  // console.log(JSON.stringify(event, null, 2)); // สามารถเปิดหรือปิดได้หลังแก้ปัญหา
+  // console.log('--- End LINE Event Log ---'); // สามารถเปิดหรือปิดได้หลังแก้ปัญหา
+
+  const groupId = event.source.groupId || event.source.roomId; // Group ID หรือ Room ID (ถ้ามี)
+  const senderUserId = event.source.userId; // User ID ของผู้ส่งข้อความ
+
   // กรณีมีสมาชิกใหม่เข้าร่วมกลุ่ม (memberJoined)
   if (event.type === 'memberJoined') {
     const inviterId = event.source.userId; // User ID ของคนเชิญ (ถ้ามี)
-    const groupId = event.source.groupId || event.source.roomId; // Group ID หรือ Room ID
-
-    // รับ User ID ของสมาชิกใหม่ที่เข้าร่วม
     const newMembers = event.joined.members.map(member => member.userId);
 
-    // ตรวจสอบว่าคนเชิญไม่ใช่แอดมิน และไม่อนุญาตให้เชิญ
-    if (!allowInvite && !isAdmin(inviterId)) {
-        // ตรวจสอบเพิ่มเติมว่าคนเชิญไม่ใช่คนที่เป็นสมาชิกใหม่ที่เพิ่งเข้ามาเอง
-        if (inviterId && !newMembers.includes(inviterId)) {
-            try {
-                await client.kickGroupMember(groupId, inviterId);
-
-                await client.pushMessage(groupId, {
-                    type: 'text',
-                    text: `คุณไม่อนุญาตให้เชิญสมาชิก กรุณาอย่าเชิญอีก`
-                });
-                console.log(`ดีดผู้ใช้ ${inviterId} ออกจากกลุ่ม ${groupId} เนื่องจากเชิญโดยไม่ได้รับอนุญาต`);
-            } catch (error) {
-                console.error('เกิดข้อผิดพลาดในการดีดสมาชิก:', error);
-                await client.pushMessage(groupId, {
-                    type: 'text',
-                    text: `ไม่สามารถดีดผู้ใช้ ${inviterId} ออกได้ (เกิดข้อผิดพลาด)`
-                });
-            }
-        }
-    }
     // ตรวจสอบว่ามีสมาชิกใหม่คนใดอยู่ในบัญชีดำหรือไม่
-    else if (blacklistedUsers.some(bannedId => newMembers.includes(bannedId))) {
-        const bannedJoinedUsers = newMembers.filter(userId => blacklistedUsers.includes(userId));
-        for (const bannedUserId of bannedJoinedUsers) {
+    if (blacklistedUsers.some(bannedId => newMembers.includes(bannedId))) {
+        for (const bannedUserId of newMembers.filter(userId => blacklistedUsers.includes(userId))) {
             try {
+                const profile = await getUserProfile(bannedUserId);
+                const displayName = profile ? profile.displayName : bannedUserId;
                 await client.kickGroupMember(groupId, bannedUserId);
                 await client.pushMessage(groupId, {
                     type: 'text',
-                    text: `ผู้ใช้ ${bannedUserId} ถูกแบนและถูกดีดออกจากกลุ่มแล้ว.`
+                    text: `ผู้ใช้ "${displayName}" ถูกแบนและถูกดีดออกจากกลุ่มแล้ว.`
                 });
                 console.log(`ดีดผู้ใช้ที่ถูกแบน ${bannedUserId} ออกจากกลุ่ม ${groupId}`);
             } catch (error) {
@@ -148,7 +145,56 @@ async function handleEvent(event) {
             }
         }
     }
-    return null; // ไม่ต้องตอบกลับสำหรับเหตุการณ์ memberJoined
+    // *** ป้องกันการเชิญโดยสมาชิกทั่วไป และป้องกันการเข้าจากลิงก์/QR Code ***
+    // ถ้าไม่อนุญาตให้เชิญ (allowInvite เป็น false)
+    // และคนเชิญไม่ใช่แอดมิน (isAdmin(inviterId) เป็น false)
+    // หรือไม่มี inviterId (มักเกิดจากการเข้าผ่านลิงก์/QR Code)
+    else if (!allowInvite && !isAdmin(inviterId)) {
+        // ดีดคนเชิญออก (หากเป็นคนเชิญจริงๆ และไม่ใช่สมาชิกใหม่ที่เพิ่งเข้ามาเอง)
+        if (inviterId && !newMembers.includes(inviterId)) {
+            try {
+                const inviterProfile = await getUserProfile(inviterId);
+                const inviterDisplayName = inviterProfile ? inviterProfile.displayName : inviterId;
+                await client.kickGroupMember(groupId, inviterId);
+
+                await client.pushMessage(groupId, {
+                    type: 'text',
+                    text: `สมาชิก "${inviterDisplayName}" ได้เชิญผู้อื่นเข้ามาในขณะที่ปิดระบบเชิญสมาชิกอยู่ จึงถูกดีดออกจากกลุ่ม`
+                });
+                console.log(`ดีดผู้ใช้ ${inviterId} ออกจากกลุ่ม ${groupId} เนื่องจากเชิญโดยไม่ได้รับอนุญาต`);
+            } catch (error) {
+                console.error('เกิดข้อผิดพลาดในการดีดคนเชิญ:', error);
+                await client.pushMessage(groupId, {
+                    type: 'text',
+                    text: `ไม่สามารถดีดผู้ใช้ ${inviterId} ออกได้ (เกิดข้อผิดพลาดในการป้องกันการเชิญ)`
+                });
+            }
+        }
+        // ดีดสมาชิกใหม่ที่เข้ามาจากการใช้ลิงก์/QR Code (ไม่มี inviterId หรือ inviterId คือบอทเอง)
+        // หรือกรณีที่คนเชิญไม่ใช่แอดมิน แต่เป็นสมาชิกใหม่ (บอทดีดคนเชิญไม่ได้ ก็ดีดสมาชิกใหม่แทน)
+        for (const newMemberId of newMembers) {
+             // ตรวจสอบว่าสมาชิกใหม่ไม่ได้ถูกเชิญโดยแอดมินที่ได้รับอนุญาต หรือเข้ามาโดยไม่มีคนเชิญ
+            if (!inviterId || !isAdmin(inviterId)) { // ถ้าไม่มีคนเชิญ (ลิงก์/QR) หรือคนเชิญไม่ใช่แอดมิน
+                try {
+                    const newMemberProfile = await getUserProfile(newMemberId);
+                    const newMemberDisplayName = newMemberProfile ? newMemberProfile.displayName : newMemberId;
+                    await client.kickGroupMember(groupId, newMemberId);
+                    await client.pushMessage(groupId, {
+                        type: 'text',
+                        text: `ผู้ใช้ "${newMemberDisplayName}" ถูกดีดออกจากกลุ่ม เนื่องจากมีการปิดการเข้ากลุ่มจากลิงก์/QR Code หรือเชิญโดยผู้ที่ไม่มีสิทธิ์`
+                    });
+                    console.log(`ดีดสมาชิกใหม่ ${newMemberId} ออกจากกลุ่ม ${groupId} เนื่องจากปิดการเชิญ/เข้าจากลิงก์`);
+                } catch (error) {
+                    console.error(`เกิดข้อผิดพลาดในการดีดสมาชิกใหม่ ${newMemberId}:`, error);
+                    await client.pushMessage(groupId, {
+                        type: 'text',
+                        text: `ไม่สามารถดีดผู้ใช้ ${newMemberId} ออกได้ (เกิดข้อผิดพลาดในการป้องกันการเข้ากลุ่ม)`
+                    });
+                }
+            }
+        }
+    }
+    return null;
   }
 
   // ไม่สนใจเหตุการณ์ที่ไม่ใช่ข้อความ หรือไม่ใช่ข้อความแบบ Text
@@ -157,27 +203,49 @@ async function handleEvent(event) {
   }
 
   const userMessage = event.message.text.trim();
-  const senderUserId = event.source.userId;
   const replyToken = event.replyToken;
+
+  // *** ป้องกันการวางลิงก์สำหรับสมาชิกทั่วไป ***
+  // ตรวจสอบว่าผู้ส่งข้อความไม่ใช่แอดมิน และ allowLinks เป็น false
+  const urlRegex = /(https?:\/\/[^\s]+)/g; // Regular expression สำหรับตรวจจับ URL
+  if (!isAdmin(senderUserId) && !allowLinks && urlRegex.test(userMessage)) {
+    try {
+        const senderProfile = await getUserProfile(senderUserId);
+        const senderDisplayName = senderProfile ? senderProfile.displayName : senderUserId;
+        await client.kickGroupMember(groupId, senderUserId);
+        await client.pushMessage(groupId, {
+            type: 'text',
+            text: `สมาชิก "${senderDisplayName}" ถูกดีดออกจากกลุ่ม เนื่องจากวางลิงก์ในขณะที่ปิดระบบวางลิงก์อยู่`
+        });
+        console.log(`ดีดผู้ใช้ ${senderUserId} ออกจากกลุ่ม ${groupId} เนื่องจากวางลิงก์โดยไม่ได้รับอนุญาต`);
+        return null; // ไม่ต้องประมวลผลข้อความนี้ต่อ
+    } catch (error) {
+        console.error('เกิดข้อผิดพลาดในการดีดผู้ใช้ออกเนื่องจากวางลิงก์:', error);
+        await client.pushMessage(groupId, {
+            type: 'text',
+            text: `ไม่สามารถดีดผู้ใช้ ${senderUserId} ออกได้ (เกิดข้อผิดพลาดในการป้องกันการวางลิงก์)`
+        });
+        // ให้ประมวลผลข้อความต่อ เพื่อให้บอทไม่เงียบไปเฉยๆ
+    }
+  }
+
 
   // --- คำสั่งสำหรับจัดการแอดมิน ---
 
   // คำสั่ง: ตั้ง @<mention> (ตั้งแอดมินหลัก)
-  // ใครก็ได้สามารถตั้งแอดมินหลักคนแรกได้ หลังจากนั้น แอดมินหลักคนปัจจุบันสามารถตั้งคนอื่นได้
-if (userMessage.startsWith('ตั้ง ')) {
-    // ตรวจสอบว่ามีข้อมูล mention และมีสมาชิกที่ถูก mention จริงๆ
+  if (userMessage.startsWith('ตั้ง ')) {
     if (event.message.mention && event.message.mention.mentionees && event.message.mention.mentionees.length > 0) {
-      const mentioneesUserId = event.message.mention.mentionees[0].userId;
+      const mentionedUserId = event.message.mention.mentionees[0].userId;
 
-      // ตรวจสอบรูปแบบคำสั่ง: "ตั้ง @<mention>"
       if (userMessage.startsWith('ตั้ง @')) {
-          // ถ้ายังไม่มีแอดมินหลักเลย ใครก็ได้สามารถตั้งคนแรกได้
-          // หรือ ถ้าผู้ส่งข้อความSเป็นแอดมินหลักอยู่แล้ว ก็สามารถตั้งคนใหม่ได้
           if (mainAdmins.length === 0 || mainAdmins.includes(senderUserId)) {
-              addMainAdmin(mentioneesUserId);
+              addMainAdmin(mentionedUserId);
+              const profile = await getUserProfile(mentionedUserId);
+              const displayName = profile ? profile.displayName : mentionedUserId;
+
               return client.replyMessage(replyToken, {
                   type: 'text',
-                  text: `ตั้งแอดมินหลักเรียบร้อยแล้ว: ${mentioneesUserId}`
+                  text: `ตั้งแอดมินหลักเรียบร้อยแล้ว: ${displayName}`
               });
           } else {
               return client.replyMessage(replyToken, {
@@ -186,39 +254,20 @@ if (userMessage.startsWith('ตั้ง ')) {
               });
           }
       } else {
-          // กรณีมี @mention แต่คำสั่งไม่ได้ขึ้นต้นด้วย "ตั้ง @" เป๊ะๆ (เช่น "ตั้งเฉยๆ @")
-          // หรืออาจจะเป็นคำสั่งอื่นที่ไม่ได้ตั้งใจให้เป็นแอดมินหลัก
-          console.log('--- Log: มี mention แต่คำสั่งไม่ตรงรูปแบบ "ตั้ง @" ---');
-          console.log('userMessage:', userMessage);
-          console.log('event.message.mention:', JSON.stringify(event.message.mention, null, 2));
           return client.replyMessage(replyToken, {
               type: 'text',
               text: 'คำสั่งไม่ถูกต้องครับ ลองใช้ "ตั้ง @ชื่อสมาชิก" เพื่อตั้งแอดมินหลัก'
           });
       }
     } else {
-      // กรณีไม่มี @mention เลย หรือโครงสร้าง mention ไม่ถูกต้อง
-      console.log('--- Log: ไม่มี mention หรือโครงสร้าง mention ไม่ถูกต้อง ---');
-      console.log('userMessage:', userMessage);
-      // ตรวจสอบและ log event.message.mention
-      if (event.message.mention === undefined) {
-          console.log('event.message.mention is UNDEFINED');
-      } else if (event.message.mention.mentionees === undefined) {
-          console.log('event.message.mention.mentionees is UNDEFINED');
-      } else {
-          console.log('event.message.mention.mentionees.length is 0 or less');
-      }
-      console.log('Full event.message:', JSON.stringify(event.message, null, 2)); // log event.message เพื่อดูว่ามี mention field ไหม
-
       return client.replyMessage(replyToken, {
         type: 'text',
         text: 'โปรด @mention คนที่ต้องการตั้งเป็นแอดมินหลักด้วยครับ (เช่น "ตั้ง @ชื่อสมาชิก")',
       });
     }
-}
+  }
 
   // คำสั่ง: ตั้งรอง @<mention> (ตั้งแอดมินรอง)
-  // เฉพาะแอดมินหลักเท่านั้นที่ตั้งแอดมินรองได้
   if (userMessage.startsWith('ตั้งรอง ')) {
     if (!mainAdmins.includes(senderUserId)) {
       return client.replyMessage(replyToken, {
@@ -227,18 +276,17 @@ if (userMessage.startsWith('ตั้ง ')) {
       });
     }
 
-    // ตรวจสอบว่ามีข้อมูล mention และมีสมาชิกที่ถูก mention จริงๆ
     if (event.message.mention && event.message.mention.mentionees && event.message.mention.mentionees.length > 0) {
-      const mentioneesUserId = event.message.mention.mentionees[0].userId;
-      // ตรวจสอบรูปแบบคำสั่ง: "ตั้งรอง @<mention>"
+      const mentionedUserId = event.message.mention.mentionees[0].userId;
       if (userMessage.startsWith('ตั้งรอง @')) {
-          addSubAdmin(mentioneesUserId);
+          addSubAdmin(mentionedUserId);
+          const profile = await getUserProfile(mentionedUserId);
+          const displayName = profile ? profile.displayName : mentionedUserId;
           return client.replyMessage(replyToken, {
             type: 'text',
-            text: `ตั้งแอดมินรองเรียบร้อยแล้ว: `,
+            text: `ตั้งแอดมินรองเรียบร้อยแล้ว: ${displayName}`,
           });
       } else {
-          // กรณีมี @mention แต่คำสั่งไม่ได้ขึ้นต้นด้วย "ตั้งรอง @" เป๊ะๆ
           return client.replyMessage(replyToken, {
               type: 'text',
               text: 'คำสั่งไม่ถูกต้องครับ ลองใช้ "ตั้งรอง @ชื่อสมาชิก" เพื่อตั้งแอดมินรอง'
@@ -255,7 +303,6 @@ if (userMessage.startsWith('ตั้ง ')) {
   // --- คำสั่งจัดการบัญชีดำ (Blacklist) ---
 
   // คำสั่ง: แบน @<mention> (แบนผู้ใช้)
-  // เฉพาะแอดมิน (หลักหรือรอง) เท่านั้นที่สามารถแบนได้
   if (userMessage.startsWith('แบน ')) {
       if (!isAdmin(senderUserId)) {
           return client.replyMessage(replyToken, {
@@ -265,27 +312,29 @@ if (userMessage.startsWith('ตั้ง ')) {
       }
 
       if (event.message.mention && event.message.mention.mentionees && event.message.mention.mentionees.length > 0) {
-          const mentioneesUserId = event.message.mention.mentionees[0].userId;
-          addBlacklistedUser(mentioneesUserId);
-          // พยายามดีดผู้ใช้ที่ถูกแบนออกจากกลุ่มทันที ถ้าอยู่ในกลุ่มนั้น
+          const mentionedUserId = event.message.mention.mentionees[0].userId;
+          addBlacklistedUser(mentionedUserId);
+          const profile = await getUserProfile(mentionedUserId);
+          const displayName = profile ? profile.displayName : mentionedUserId;
+
           if (event.source.type === 'group' || event.source.type === 'room') {
             try {
-                await client.kickGroupMember(event.source.groupId || event.source.roomId, mentioneesUserId);
+                await client.kickGroupMember(groupId, mentionedUserId);
                 return client.replyMessage(replyToken, {
                     type: 'text',
-                    text: `ผู้ใช้ ${mentioneesUserId} ถูกแบนและถูกดีดออกจากกลุ่มแล้วครับ`
+                    text: `ผู้ใช้ "${displayName}" ถูกแบนและถูกดีดออกจากกลุ่มแล้วครับ`
                 });
             } catch (error) {
-                console.error(`เกิดข้อผิดพลาดในการดีดผู้ใช้ที่ถูกแบน ${mentioneesUserId}:`, error);
+                console.error(`เกิดข้อผิดพลาดในการดีดผู้ใช้ที่ถูกแบน ${mentionedUserId}:`, error);
                 return client.replyMessage(replyToken, {
                     type: 'text',
-                    text: `ผู้ใช้ ${mentioneesUserId} ถูกแบนแล้ว แต่ไม่สามารถดีดออกจากกลุ่มได้ (อาจไม่ได้อยู่ในกลุ่ม หรือเกิดข้อผิดพลาด)`
+                    text: `ผู้ใช้ "${displayName}" ถูกแบนแล้ว แต่ไม่สามารถดีดออกจากกลุ่มได้ (อาจไม่ได้อยู่ในกลุ่ม หรือเกิดข้อผิดพลาด)`
                 });
             }
           }
           return client.replyMessage(replyToken, {
             type: 'text',
-            text: `ผู้ใช้ ${mentioneesUserId} ถูกแบนเรียบร้อยแล้วครับ`,
+            text: `ผู้ใช้ "${displayName}" ถูกแบนเรียบร้อยแล้วครับ`,
           });
       } else {
           return client.replyMessage(replyToken, {
@@ -296,7 +345,6 @@ if (userMessage.startsWith('ตั้ง ')) {
   }
 
   // คำสั่ง: ล้างดำ (ล้างบัญชีดำทั้งหมด / ปลดแบนทุกคน)
-  // เฉพาะแอดมิน (หลักหรือรอง) เท่านั้นที่ใช้คำสั่งนี้ได้
   if (userMessage === 'ล้างดำ') {
       if (!isAdmin(senderUserId)) {
           return client.replyMessage(replyToken, {
@@ -304,7 +352,7 @@ if (userMessage.startsWith('ตั้ง ')) {
               text: 'เฉพาะแอดมินเท่านั้นที่สามารถใช้คำสั่ง "ล้างดำ" ได้ครับ'
           });
       }
-      blacklistedUsers.length = 0; // ล้างข้อมูลใน Array ให้ว่างเปล่า
+      blacklistedUsers.length = 0;
       return client.replyMessage(replyToken, {
         type: 'text',
         text: 'รายชื่อผู้ถูกแบนทั้งหมดถูกล้างแล้วครับ ผู้ที่เคยถูกแบนสามารถเชิญกลับเข้ามาได้แล้ว',
@@ -312,7 +360,6 @@ if (userMessage.startsWith('ตั้ง ')) {
   }
 
   // คำสั่ง: ปลดแบน @<mention> (ปลดแบนผู้ใช้ที่ระบุ)
-  // เฉพาะแอดมิน (หลักหรือรอง) เท่านั้นที่ใช้คำสั่งนี้ได้
   if (userMessage.startsWith('ปลดแบน ')) {
       if (!isAdmin(senderUserId)) {
           return client.replyMessage(replyToken, {
@@ -321,16 +368,19 @@ if (userMessage.startsWith('ตั้ง ')) {
           });
       }
       if (event.message.mention && event.message.mention.mentionees && event.message.mention.mentionees.length > 0) {
-          const mentioneesUserId = event.message.mention.mentionees[0].userId;
-          if (removeBlacklistedUser(mentioneesUserId)) {
+          const mentionedUserId = event.message.mention.mentionees[0].userId;
+          const profile = await getUserProfile(mentionedUserId);
+          const displayName = profile ? profile.displayName : mentionedUserId;
+
+          if (removeBlacklistedUser(mentionedUserId)) {
               return client.replyMessage(replyToken, {
                   type: 'text',
-                  text: `ผู้ใช้ ${mentioneesUserId} ถูกปลดแบนเรียบร้อยแล้วครับ`
+                  text: `ผู้ใช้ "${displayName}" ถูกปลดแบนเรียบร้อยแล้วครับ`
               });
           } else {
               return client.replyMessage(replyToken, {
                   type: 'text',
-                  text: `ผู้ใช้ ${mentioneesUserId} ไม่ได้อยู่ในรายชื่อผู้ถูกแบนครับ`
+                  text: `ผู้ใช้ "${displayName}" ไม่ได้อยู่ในรายชื่อผู้ถูกแบนครับ`
               });
           }
       } else {
@@ -344,7 +394,6 @@ if (userMessage.startsWith('ตั้ง ')) {
   // --- คำสั่งควบคุมการเชิญสมาชิก (Invitation Control) ---
 
   // คำสั่ง: เปิดเชิญ (อนุญาตให้เชิญสมาชิก)
-  // เฉพาะแอดมิน (หลักหรือรอง) เท่านั้นที่ใช้คำสั่งนี้ได้
   if (userMessage === 'เปิดเชิญ') {
     if (!isAdmin(senderUserId)) {
       return client.replyMessage(replyToken, {
@@ -360,7 +409,6 @@ if (userMessage.startsWith('ตั้ง ')) {
   }
 
   // คำสั่ง: ปิดเชิญ (ไม่อนุญาตให้เชิญสมาชิก)
-  // เฉพาะแอดมิน (หลักหรือรอง) เท่านั้นที่ใช้คำสั่งนี้ได้
   if (userMessage === 'ปิดเชิญ') {
     if (!isAdmin(senderUserId)) {
       return client.replyMessage(replyToken, {
@@ -375,6 +423,39 @@ if (userMessage.startsWith('ตั้ง ')) {
     });
   }
 
+  // --- คำสั่งควบคุมการวางลิงก์ ---
+
+  // คำสั่ง: เปิดลิงก์ (อนุญาตให้วางลิงก์ได้)
+  if (userMessage === 'เปิดลิงก์') {
+    if (!isAdmin(senderUserId)) {
+      return client.replyMessage(replyToken, {
+        type: 'text',
+        text: 'เฉพาะแอดมินเท่านั้นที่สามารถใช้คำสั่ง "เปิดลิงก์" ได้ครับ',
+      });
+    }
+    allowLinks = true;
+    return client.replyMessage(replyToken, {
+      type: 'text',
+      text: 'ตอนนี้อนุญาตให้สมาชิกทั่วไปวางลิงก์ได้ครับ',
+    });
+  }
+
+  // คำสั่ง: ปิดลิงก์ (ไม่อนุญาตให้สมาชิกทั่วไปวางลิงก์)
+  if (userMessage === 'ปิดลิงก์') {
+    if (!isAdmin(senderUserId)) {
+      return client.replyMessage(replyToken, {
+        type: 'text',
+        text: 'เฉพาะแอดมินเท่านั้นที่สามารถใช้คำสั่ง "ปิดลิงก์" ได้ครับ',
+      });
+    }
+    allowLinks = false;
+    return client.replyMessage(replyToken, {
+      type: 'text',
+      text: 'ปิดระบบวางลิงก์แล้ว ห้ามสมาชิกทั่วไปวางลิงก์ครับ',
+    });
+  }
+
+
   // --- คำสั่งทั่วไป (สำหรับแอดมินเท่านั้น) ---
   // คำสั่ง: รายชื่อแอดมิน
   if (userMessage === 'รายชื่อแอดมิน') {
@@ -385,33 +466,48 @@ if (userMessage.startsWith('ตั้ง ')) {
         });
     }
     let responseText = '--- รายชื่อแอดมินและผู้ถูกแบน ---\n';
+
+    // ดึงชื่อแอดมินหลัก
     responseText += `**แอดมินหลัก** (${mainAdmins.length} คน):\n`;
     if (mainAdmins.length > 0) {
         for (const adminId of mainAdmins) {
-            // ในแอปพลิเคชันจริง อาจจะดึง Profile ของผู้ใช้มาแสดงชื่อแทน User ID
-            responseText += `- ${adminId}\n`;
+            const profile = await getUserProfile(adminId);
+            const displayName = profile ? profile.displayName : adminId;
+            responseText += `- ${displayName} (ID: ${adminId})\n`;
         }
     } else {
         responseText += '- ไม่มีแอดมินหลัก\n';
     }
 
+    // ดึงชื่อแอดมินรอง
     responseText += `**แอดมินรอง** (${subAdmins.length} คน):\n`;
     if (subAdmins.length > 0) {
         for (const adminId of subAdmins) {
-            responseText += `- ${adminId}\n`;
+            const profile = await getUserProfile(adminId);
+            const displayName = profile ? profile.displayName : adminId;
+            responseText += `- ${displayName} (ID: ${adminId})\n`;
         }
     } else {
         responseText += '- ไม่มีแอดมินรอง\n';
     }
 
+    // ดึงชื่อผู้ถูกแบน
     responseText += `**รายชื่อผู้ถูกแบน** (${blacklistedUsers.length} คน):\n`;
     if (blacklistedUsers.length > 0) {
         for (const bannedId of blacklistedUsers) {
-            responseText += `- ${bannedId}\n`;
+            const profile = await getUserProfile(bannedId);
+            const displayName = profile ? profile.displayName : bannedId;
+            responseText += `- ${displayName} (ID: ${bannedId})\n`;
         }
     } else {
         responseText += '- ไม่มีผู้ถูกแบน\n';
     }
+
+    // แสดงสถานะการตั้งค่าปัจจุบัน
+    responseText += `\n--- สถานะการตั้งค่า ---\n`;
+    responseText += `อนุญาตให้เชิญสมาชิก: ${allowInvite ? 'เปิด' : 'ปิด'}\n`;
+    responseText += `อนุญาตให้วางลิงก์: ${allowLinks ? 'เปิด' : 'ปิด'}\n`;
+
 
     return client.replyMessage(replyToken, {
         type: 'text',
@@ -421,7 +517,6 @@ if (userMessage.startsWith('ตั้ง ')) {
 
   // คำสั่ง: ลบแอด @<mention> (ลบตำแหน่งแอดมิน)
   if (userMessage.startsWith('ลบแอด ')) {
-    // เฉพาะแอดมินหลักเท่านั้นที่สามารถลบตำแหน่งแอดมินคนอื่นได้
     if (!mainAdmins.includes(senderUserId)) {
       return client.replyMessage(replyToken, {
         type: 'text',
@@ -430,16 +525,19 @@ if (userMessage.startsWith('ตั้ง ')) {
     }
 
     if (event.message.mention && event.message.mention.mentionees && event.message.mention.mentionees.length > 0) {
-      const mentioneesUserId = event.message.mention.mentionees[0].userId;
-      if (removeAdmin(mentioneesUserId)) {
+      const mentionedUserId = event.message.mention.mentionees[0].userId;
+      const profile = await getUserProfile(mentionedUserId);
+      const displayName = profile ? profile.displayName : mentionedUserId;
+
+      if (removeAdmin(mentionedUserId)) {
           return client.replyMessage(replyToken, {
               type: 'text',
-              text: `ผู้ใช้ ${mentioneesUserId} ถูกลบออกจากตำแหน่งแอดมินแล้วครับ`
+              text: `ผู้ใช้ "${displayName}" ถูกลบออกจากตำแหน่งแอดมินแล้วครับ`
           });
       } else {
           return client.replyMessage(replyToken, {
               type: 'text',
-              text: `ผู้ใช้ ${mentioneesUserId} ไม่ใช่แอดมิน`
+              text: `ผู้ใช้ "${displayName}" ไม่ใช่แอดมิน`
           });
       }
     } else {
@@ -450,9 +548,7 @@ if (userMessage.startsWith('ตั้ง ')) {
     }
   }
 
-
   // คำสั่งสำรองสำหรับข้อความที่ไม่ตรงกับคำสั่งใดๆ
-  // บอทจะตอบกลับข้อความที่ผู้ใช้พิมพ์มา
   return client.replyMessage(replyToken, {
     type: 'text',
     text: `คุณพิมพ์: "${userMessage}" (ยังไม่มีคำสั่งนี้ หรือคำสั่งไม่ถูกต้อง)`,
